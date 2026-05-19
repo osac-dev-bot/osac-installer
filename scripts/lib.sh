@@ -60,3 +60,31 @@ wait_for_resource() {
 
     oc wait --for="${condition}" "${resource}" ${ns_args[@]+"${ns_args[@]}"} --timeout="${timeout}s"
 }
+
+# Retry a command until it succeeds or times out.
+# All output (stdout/stderr) is preserved on every attempt.
+# Usage: retry_command <timeout_seconds> <interval_seconds> <command> [args...]
+retry_command() {
+    local timeout="$1"
+    local interval="$2"
+    shift 2
+    local start=${SECONDS}
+    local attempt=1
+    while true; do
+        local elapsed=$(( SECONDS - start ))
+        echo "  retry_command[attempt=${attempt} elapsed=${elapsed}s timeout=${timeout}s]: $*"
+        local rc=0
+        "$@" || rc=$?
+        if (( rc == 0 )); then
+            echo "  retry_command: succeeded on attempt ${attempt} after $(( SECONDS - start ))s"
+            return 0
+        fi
+        if (( SECONDS - start >= timeout )); then
+            echo "  retry_command: FAILED after ${attempt} attempts, $(( SECONDS - start ))s elapsed (exit code ${rc})"
+            return "${rc}"
+        fi
+        echo "  retry_command: exit code ${rc}, retrying in ${interval}s..."
+        sleep "${interval}"
+        attempt=$(( attempt + 1 ))
+    done
+}

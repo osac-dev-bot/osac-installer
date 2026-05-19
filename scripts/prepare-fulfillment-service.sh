@@ -20,10 +20,17 @@ INSTALLER_CLUSTER_TEMPLATE=${INSTALLER_CLUSTER_TEMPLATE:-}
 # The private API (osac.private.v1.*) is only available via the internal listener
 # (fulfillment-internal-api route, port 8001). The external listener
 # (fulfillment-api route, port 8000) only routes public API methods.
-FULFILLMENT_INTERNAL_API_URL=https://$(oc get route -n ${INSTALLER_NAMESPACE} fulfillment-internal-api -o jsonpath='{.status.ingress[0].host}')
-osac login --insecure --private --token-script "oc create token -n ${INSTALLER_NAMESPACE} admin" --address ${FULFILLMENT_INTERNAL_API_URL}
-osac delete hub hub
-osac create hub --kubeconfig=/tmp/kubeconfig.hub-access --id hub --namespace ${INSTALLER_NAMESPACE}
+FULFILLMENT_INTERNAL_API_URL=https://$(oc get route -n "${INSTALLER_NAMESPACE}" fulfillment-internal-api -o jsonpath='{.status.ingress[0].host}')
+echo "Fulfillment internal API URL: ${FULFILLMENT_INTERNAL_API_URL}"
+
+echo "Logging into fulfillment internal API..."
+retry_command 300 10 osac login --insecure --private --token-script "oc create token -n ${INSTALLER_NAMESPACE} admin" --address "${FULFILLMENT_INTERNAL_API_URL}"
+
+echo "Deleting existing hub..."
+retry_command 300 10 osac delete hub hub
+
+echo "Creating hub..."
+retry_command 300 10 osac create hub --kubeconfig=/tmp/kubeconfig.hub-access --id hub --namespace "${INSTALLER_NAMESPACE}"
 
 if [[ -n "${INSTALLER_VM_TEMPLATE}" || -n "${INSTALLER_CLUSTER_TEMPLATE}" ]]; then
     # Trigger a one-time publish-templates AAP job
