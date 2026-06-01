@@ -37,7 +37,7 @@ if [[ -n "${INSTALLER_VM_TEMPLATE}" || -n "${INSTALLER_CLUSTER_TEMPLATE}" ]]; th
     AAP_ROUTE_HOST=$(oc get routes -n "${INSTALLER_NAMESPACE}" --no-headers osac-aap -o jsonpath='{.spec.host}')
     AAP_URL="https://${AAP_ROUTE_HOST}"
     AAP_TOKEN=$(oc get secret osac-aap-api-token -n "${INSTALLER_NAMESPACE}" -o jsonpath='{.data.token}' | base64 -d)
-    echo "Waiting for AAP controller API to be ready..."
+    echo "Waiting for AAP controller API and project sync..."
     for attempt in $(seq 1 30); do
         JT_ID=$(curl -kfsS -H "Authorization: Bearer ${AAP_TOKEN}" \
             "${AAP_URL}/api/controller/v2/job_templates/?name=osac-publish-templates" 2>/dev/null | jq -er '.results[0].id // empty' 2>/dev/null) && break
@@ -45,18 +45,31 @@ if [[ -n "${INSTALLER_VM_TEMPLATE}" || -n "${INSTALLER_CLUSTER_TEMPLATE}" ]]; th
         sleep 10
     done
     [[ -z "${JT_ID:-}" ]] && { echo "Failed to find osac-publish-templates AAP job template after 30 attempts"; exit 1; }
+    PROJECT_ID=$(curl -kfsS -H "Authorization: Bearer ${AAP_TOKEN}" \
+        "${AAP_URL}/api/controller/v2/job_templates/${JT_ID}/" 2>/dev/null | jq -r '.project // empty') || PROJECT_ID=""
+    if [[ -n "${PROJECT_ID}" ]]; then
+        echo "  Waiting for AAP project ${PROJECT_ID} to sync..."
+        retry_until 300 10 '[[ "$(curl -kfsS -H "Authorization: Bearer '"${AAP_TOKEN}"'" \
+            "'"${AAP_URL}"'/api/controller/v2/projects/'"${PROJECT_ID}"'/" 2>/dev/null \
+            | jq -r ".status // empty")" == "successful" ]]' || {
+            echo "WARNING: AAP project sync may not be complete"
+        }
+    fi
     echo "Launching publish-templates AAP job (template ID: ${JT_ID})..."
     JOB_ID=""
     for attempt in $(seq 1 10); do
-        JOB_RESPONSE=$(curl -kfsS -X POST -H "Authorization: Bearer ${AAP_TOKEN}" -H "Content-Type: application/json" \
-            "${AAP_URL}/api/controller/v2/job_templates/${JT_ID}/launch/" 2>/dev/null) && {
+        LAUNCH_ERR=$(mktemp)
+        JOB_RESPONSE=$(curl -ksS -X POST -H "Authorization: Bearer ${AAP_TOKEN}" -H "Content-Type: application/json" \
+            "${AAP_URL}/api/controller/v2/job_templates/${JT_ID}/launch/" 2>"${LAUNCH_ERR}") && {
             JOB_ID=$(echo "${JOB_RESPONSE}" | jq -r '.id // empty')
-            break
+            [[ -n "${JOB_ID}" && "${JOB_ID}" != "null" ]] && break
         }
         echo "  launch attempt ${attempt}/10 - retrying in 10s..."
+        HTTP_BODY=$(echo "${JOB_RESPONSE}" | jq -r '.playbook[0] // .detail // empty' 2>/dev/null)
+        [[ -n "${HTTP_BODY}" ]] && echo "    reason: ${HTTP_BODY}"
         sleep 10
     done
-    [[ -z "${JOB_ID}" ]] && { echo "ERROR: Failed to launch publish-templates job after 10 attempts"; exit 1; }
+    [[ -z "${JOB_ID}" || "${JOB_ID}" == "null" ]] && { echo "ERROR: Failed to launch publish-templates job after 10 attempts"; exit 1; }
     echo "  Job ${JOB_ID} launched, waiting for completion..."
     retry_until 300 10 '[[ "$(curl -kfsS -H "Authorization: Bearer '"${AAP_TOKEN}"'" \
         "'"${AAP_URL}"'/api/controller/v2/jobs/'"${JOB_ID}"'/" 2>/dev/null \
