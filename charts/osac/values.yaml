@@ -243,3 +243,8 @@ networkFulfillment:
     NETRIS_TENANT_NAME: ""
   secret:
     NETRIS_PASSWORD: ""
+
+# --- CAPI Provider RBAC ---
+capiProvider:
+  enabled: true
+  agentNamespace: hardware-inventory
