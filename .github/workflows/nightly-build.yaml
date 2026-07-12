@@ -23,10 +23,10 @@ env:
     osac-aap:osac-aap:base/osac-aap:inline:base/osac-aap/charts/aap
     bare-metal-fulfillment-operator:bare-metal-fulfillment-operator:base/bare-metal-fulfillment-operator:tag:base/bare-metal-fulfillment-operator/charts/operator
     osac-ui:osac-ui:base/osac-ui:inline:base/osac-ui/charts/ui
-  # CRD charts (no image, just chart paths)
+  # CRD charts: name, submodule path, chart path (no image, so no tag-mode field)
   CRD_CHARTS: >-
-    osac-operator-crds:base/osac-operator/charts/operator-crds
-    bare-metal-fulfillment-operator-crds:base/bare-metal-fulfillment-operator/charts/operator-crds
+    osac-operator-crds:base/osac-operator:base/osac-operator/charts/operator-crds
+    bare-metal-fulfillment-operator-crds:base/bare-metal-fulfillment-operator:base/bare-metal-fulfillment-operator/charts/operator-crds
 
 jobs:
   # -------------------------------------------------------------------
@@ -40,6 +40,8 @@ jobs:
       packages: read
     outputs:
       version: ${{ steps.version.outputs.version }}
+      base-version: ${{ steps.version.outputs.base-version }}
+      nightly-suffix: ${{ steps.version.outputs.nightly-suffix }}
       temp-branch: ${{ steps.push.outputs.branch }}
       temp-sha: ${{ steps.push.outputs.sha }}
 
@@ -102,7 +104,14 @@ jobs:
         set -euo pipefail
         DATE=$(date -u +%Y%m%d)
         SHORT_SHA=$(git rev-parse --short=7 HEAD)
-        BRANCH="nightly/${DATE}-${SHORT_SHA}"
+        # Include the run ID (unique per workflow run) and run attempt
+        # (increments on "Re-run failed jobs", where the run ID itself
+        # stays the same) so no combination of same-day manual re-run,
+        # whether a fresh dispatch or an in-place re-run, can ever collide
+        # with an existing branch — a plain date+sha name is only unique
+        # if main has advanced since the last run, which isn't true for
+        # either case and causes a non-fast-forward push rejection.
+        BRANCH="nightly/${DATE}-${SHORT_SHA}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
 
         git config user.name "github-actions[bot]"
         git config user.email "github-actions[bot]@users.noreply.github.com"
@@ -122,11 +131,28 @@ jobs:
       env:
         COMMIT_SHA: ${{ steps.push.outputs.sha }}
       run: |
-        BASE_VERSION=$(yq '.version' charts/osac/Chart.yaml)
+        set -euo pipefail
+        source ./scripts/lib.sh
         DATE=$(date -u +%Y%m%d)
         SHORT_SHA="${COMMIT_SHA:0:7}"
-        VERSION="${BASE_VERSION}-nightly.${DATE}.${SHORT_SHA}.${GITHUB_RUN_NUMBER}"
+        # GITHUB_RUN_NUMBER, like GITHUB_RUN_ID, stays constant across a
+        # "Re-run failed jobs" of the same run — only GITHUB_RUN_ATTEMPT
+        # increments there. Without it, re-running the same failed run
+        # would produce the identical chart version string, matching the
+        # temp-branch collision fixed above.
+        NIGHTLY_SUFFIX="nightly.${DATE}.${SHORT_SHA}.${GITHUB_RUN_NUMBER}.${GITHUB_RUN_ATTEMPT}"
+
+        # Use the umbrella chart's own latest real release tag (not the
+        # Chart.yaml placeholder, which is never bumped) so the nightly
+        # version reflects where this build actually sits relative to
+        # real releases.
+        BASE_TAG=$(resolve_release_tag .)
+        BASE_VERSION="${BASE_TAG#v}"
+        VERSION="${BASE_VERSION}-${NIGHTLY_SUFFIX}"
+
         echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+        echo "base-version=${BASE_VERSION}" >> "$GITHUB_OUTPUT"
+        echo "nightly-suffix=${NIGHTLY_SUFFIX}" >> "$GITHUB_OUTPUT"
         echo "Nightly version: ${VERSION} (base: ${BASE_VERSION})"
 
   # -------------------------------------------------------------------
@@ -159,6 +185,8 @@ jobs:
       packages: write
     env:
       VERSION: ${{ needs.prepare.outputs.version }}
+      BASE_VERSION: ${{ needs.prepare.outputs.base-version }}
+      NIGHTLY_SUFFIX: ${{ needs.prepare.outputs.nightly-suffix }}
 
     steps:
     - name: Checkout temporary branch
@@ -184,20 +212,33 @@ jobs:
         GHCR_USER: ${{ github.actor }}
       run: printf '%s' "${GHCR_TOKEN}" | helm registry login "${{ env.REGISTRY }}" -u "${GHCR_USER}" --password-stdin
 
+    - name: Compute per-chart versions
+      run: ./scripts/generate-chart-versions.sh
+
+    - name: Upload chart-versions.txt
+      uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
+      with:
+        name: chart-versions-${{ needs.prepare.outputs.version }}
+        path: chart-versions.txt
+        retention-days: 1
+
     - name: Publish component charts
       env:
         OCI_REPO: oci://${{ env.REGISTRY }}/${{ env.CHARTS_REPO }}
       run: |
         set -euo pipefail
+        get_version() { ./scripts/get-chart-version.sh "$1"; }
         published=""
 
         for entry in ${CRD_CHARTS}; do
           chart_name="${entry%%:*}"
-          chart_path="${entry#*:}"
-          echo "--- Publishing ${chart_name} ---"
-          helm package "${chart_path}" --version "${VERSION}"
-          helm push "${chart_name}-${VERSION}.tgz" "${OCI_REPO}"
-          published="${published}\n${chart_name}:${VERSION}"
+          rest="${entry#*:}"
+          chart_path="${rest#*:}"
+          version=$(get_version "${chart_name}")
+          echo "--- Publishing ${chart_name} (${version}) ---"
+          helm package "${chart_path}" --version "${version}"
+          helm push "${chart_name}-${version}.tgz" "${OCI_REPO}"
+          published="${published}\n${chart_name}:${version}"
         done
 
         for entry in ${COMPONENTS}; do
@@ -206,10 +247,11 @@ jobs:
           rest="${rest#*:}"
           rest="${rest#*:}"
           chart_path="${rest#*:}"
-          echo "--- Publishing ${component} ---"
-          helm package "${chart_path}" --version "${VERSION}"
-          helm push "${component}-${VERSION}.tgz" "${OCI_REPO}"
-          published="${published}\n${component}:${VERSION}"
+          version=$(get_version "${component}")
+          echo "--- Publishing ${component} (${version}) ---"
+          helm package "${chart_path}" --version "${version}"
+          helm push "${component}-${version}.tgz" "${OCI_REPO}"
+          published="${published}\n${component}:${version}"
         done
 
         echo -e "Published charts:${published}"
@@ -219,15 +261,18 @@ jobs:
         OCI_REPO: oci://${{ env.REGISTRY }}/${{ env.CHARTS_REPO }}
       run: |
         set -euo pipefail
+        get_version() { ./scripts/get-chart-version.sh "$1"; }
         for entry in ${CRD_CHARTS}; do
           chart_name="${entry%%:*}"
-          echo "Verifying ${chart_name}..."
-          helm show chart "${OCI_REPO}/${chart_name}" --version "${VERSION}"
+          version=$(get_version "${chart_name}")
+          echo "Verifying ${chart_name} (${version})..."
+          helm show chart "${OCI_REPO}/${chart_name}" --version "${version}"
         done
         for entry in ${COMPONENTS}; do
           component="${entry%%:*}"
-          echo "Verifying ${component}..."
-          helm show chart "${OCI_REPO}/${component}" --version "${VERSION}"
+          version=$(get_version "${component}")
+          echo "Verifying ${component} (${version})..."
+          helm show chart "${OCI_REPO}/${component}" --version "${version}"
         done
 
     - name: Rewrite umbrella chart to use published components
@@ -235,17 +280,22 @@ jobs:
         OCI_REPO: oci://${{ env.REGISTRY }}/${{ env.CHARTS_REPO }}
       run: |
         set -euo pipefail
+        GET_VERSION_SCRIPT="$(pwd)/scripts/get-chart-version.sh"
+        CHART_VERSIONS_FILE="$(pwd)/chart-versions.txt"
+        get_version() { "${GET_VERSION_SCRIPT}" "$1" 1 "${CHART_VERSIONS_FILE}"; }
         cd charts/osac
 
         for entry in ${CRD_CHARTS}; do
           chart_name="${entry%%:*}"
+          version=$(get_version "${chart_name}")
           yq -i "(.dependencies[] | select(.name == \"${chart_name}\")).repository = \"${OCI_REPO}\"" Chart.yaml
-          yq -i "(.dependencies[] | select(.name == \"${chart_name}\")).version = \"${VERSION}\"" Chart.yaml
+          yq -i "(.dependencies[] | select(.name == \"${chart_name}\")).version = \"${version}\"" Chart.yaml
         done
         for entry in ${COMPONENTS}; do
           component="${entry%%:*}"
+          version=$(get_version "${component}")
           yq -i "(.dependencies[] | select(.name == \"${component}\")).repository = \"${OCI_REPO}\"" Chart.yaml
-          yq -i "(.dependencies[] | select(.name == \"${component}\")).version = \"${VERSION}\"" Chart.yaml
+          yq -i "(.dependencies[] | select(.name == \"${component}\")).version = \"${version}\"" Chart.yaml
         done
 
         rm -f Chart.lock
@@ -305,6 +355,8 @@ jobs:
         helm show chart "${OCI_REPO}/osac" --version "${VERSION}"
 
     - name: Generate images.txt
+      env:
+        REPO_OWNER: ${{ github.repository_owner }}
       run: |
         set -euo pipefail
         helm template osac "osac-${VERSION}.tgz" \
@@ -337,30 +389,28 @@ jobs:
         done
         grep -v -F -f images.txt images-raw.txt | sort >> images.txt || true
 
+        get_version() { ./scripts/get-chart-version.sh "$1" 1; }
+        get_source_tag() { ./scripts/get-chart-version.sh "$1" 2; }
+        get_source_sha() { ./scripts/get-chart-version.sh "$1" 3; }
+        OCI_BASE="${REGISTRY}/${REPO_OWNER}/charts"
         echo "" >> images.txt
-        echo "# Component versions" >> images.txt
-        for entry in ${COMPONENTS}; do
-          component="${entry%%:*}"
-          rest="${entry#*:}"
-          rest="${rest#*:}"
-          submodule_path="${rest%%:*}"
-          version=$(git -C "${submodule_path}" describe --tags --abbrev=0 2>/dev/null || echo "unknown")
-          sha=$(git -C "${submodule_path}" rev-parse --short=7 HEAD 2>/dev/null || echo "unknown")
-          echo "# ${component}=${version} (${sha})" >> images.txt
-        done
-
-        OCI_BASE="${REGISTRY}/${{ github.repository_owner }}/charts"
-        echo "" >> images.txt
-        echo "# Chart versions (${VERSION})" >> images.txt
+        echo "# Chart source & versions" >> images.txt
         for entry in ${CRD_CHARTS}; do
           chart_name="${entry%%:*}"
-          echo "# oci://${OCI_BASE}/${chart_name}:${VERSION}" >> images.txt
+          chart_version=$(get_version "${chart_name}")
+          src_tag=$(get_source_tag "${chart_name}")
+          src_sha=$(get_source_sha "${chart_name}")
+          echo "# ${chart_name}: source=${src_tag} (${src_sha}), chart=oci://${OCI_BASE}/${chart_name}:${chart_version}" >> images.txt
         done
         for entry in ${COMPONENTS}; do
           component="${entry%%:*}"
-          echo "# oci://${OCI_BASE}/${component}:${VERSION}" >> images.txt
+          chart_version=$(get_version "${component}")
+          src_tag=$(get_source_tag "${component}")
+          src_sha=$(get_source_sha "${component}")
+          echo "# ${component}: source=${src_tag} (${src_sha}), chart=oci://${OCI_BASE}/${component}:${chart_version}" >> images.txt
         done
-        echo "# oci://${OCI_BASE}/osac:${VERSION}" >> images.txt
+        UMBRELLA_SHA=$(git rev-parse --short=7 HEAD 2>/dev/null || echo "unknown")
+        echo "# osac: source=v${BASE_VERSION} (${UMBRELLA_SHA}), chart=oci://${OCI_BASE}/osac:${VERSION}" >> images.txt
 
         rm -f images-raw.txt
 
@@ -387,6 +437,8 @@ jobs:
     permissions:
       # Create nightly git tags and delete temp branch
       contents: write
+      # Look up package version URLs for the Slack notification
+      packages: read
     env:
       VERSION: ${{ needs.prepare.outputs.version }}
       TEMP_BRANCH: ${{ needs.prepare.outputs.temp-branch }}
@@ -398,6 +450,11 @@ jobs:
         ref: ${{ needs.prepare.outputs.temp-branch }}
         fetch-depth: 0
         token: ${{ secrets.GITHUB_TOKEN }}
+
+    - name: Download chart-versions.txt
+      uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4
+      with:
+        name: chart-versions-${{ needs.prepare.outputs.version }}
 
     - name: Create nightly tag
       run: |
@@ -438,27 +495,122 @@ jobs:
         REPOSITORY: ${{ github.repository }}
         RUN_ID: ${{ github.run_id }}
         REPO_OWNER: ${{ github.repository_owner }}
+        GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       run: |
-        OCI_BASE="oci://ghcr.io/${REPO_OWNER}/charts"
+        set -euo pipefail
+        get_version() { ./scripts/get-chart-version.sh "$1"; }
+
+        # Package version pages are keyed by numeric version id, not the
+        # tag -- look the id up via the Packages API. Versions are
+        # returned newest-first, so the one we just pushed is always near
+        # the top of the first page. Without ?tag=, GitHub's UI shows the
+        # page titled by digest instead of the human-readable tag (tag is
+        # URL-encoded since it ends up in a query string).
+        #
+        # Best-effort only: GITHUB_TOKEN's packages:read permission is
+        # scoped to this repo, and most of these charts are linked to
+        # sibling repos (osac-operator, fulfillment-service, etc.), so the
+        # lookup may 403. Never let a failed/empty lookup take down the
+        # whole notification -- degrade to a plain, unlinked version
+        # instead. `|| true` at each call site absorbs curl/jq failures
+        # under `set -e`.
+        chart_version_url() {
+          local chart_name=$1 version=$2
+          local encoded_version url
+          encoded_version=$(jq -rn --arg v "${version}" '$v|@uri')
+          url=$(curl -sf --max-time 15 \
+            -H "Authorization: Bearer ${GH_TOKEN}" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/orgs/${REPO_OWNER}/packages/container/charts%2F${chart_name}/versions?per_page=100" \
+          | jq -r --arg v "${version}" '.[] | select(.metadata.container.tags | index($v)) | .html_url' \
+          | head -1) || true
+          [ -n "${url}" ] && echo "${url}?tag=${encoded_version}"
+        }
+
+        declare -a NAMES VERSIONS URLS
+        for entry in ${CRD_CHARTS}; do
+          chart_name="${entry%%:*}"
+          version=$(get_version "${chart_name}")
+          NAMES+=("${chart_name}")
+          VERSIONS+=("${version}")
+          URLS+=("$(chart_version_url "${chart_name}" "${version}" || true)")
+        done
+        for entry in ${COMPONENTS}; do
+          component="${entry%%:*}"
+          version=$(get_version "${component}")
+          NAMES+=("${component}")
+          VERSIONS+=("${version}")
+          URLS+=("$(chart_version_url "${component}" "${version}" || true)")
+        done
+        NAMES+=("osac (umbrella)")
+        VERSIONS+=("${VERSION}")
+        URLS+=("$(chart_version_url "osac" "${VERSION}" || true)")
+
+        max_len() {
+          local max=${#1}
+          shift
+          for s in "$@"; do
+            (( ${#s} > max )) && max=${#s}
+          done
+          echo "${max}"
+        }
+        NAME_W=$(max_len "Chart" "${NAMES[@]}")
+        VERSION_W=$(max_len "Version" "${VERSIONS[@]}")
+
+        hline() { printf '─%.0s' $(seq 1 "$(($1 + 2))"); }
+        name_cell() { printf '%-*s' "${NAME_W}" "$1"; }
+        # Padding is based on the visible label length (the plain version
+        # string), not the raw <url|label> markup length -- the url, pipe,
+        # and angle brackets are invisible once Slack renders the link, so
+        # padding on the raw length would misalign the right border.
+        version_cell() {
+          local version=$1 url=$2
+          local pad=$(( VERSION_W - ${#version} ))
+          (( pad < 0 )) && pad=0
+          if [ -n "${url}" ]; then
+            printf '<%s|%s>%*s' "${url}" "${version}" "${pad}" ""
+          else
+            printf '%s%*s' "${version}" "${pad}" ""
+          fi
+        }
+
+        TABLE="┌$(hline "${NAME_W}")┬$(hline "${VERSION_W}")┐"
+        TABLE="${TABLE}"$'\n'"│ $(name_cell "Chart") │ $(version_cell "Version" "") │"
+        TABLE="${TABLE}"$'\n'"├$(hline "${NAME_W}")┼$(hline "${VERSION_W}")┤"
+        for i in "${!NAMES[@]}"; do
+          TABLE="${TABLE}"$'\n'"│ $(name_cell "${NAMES[$i]}") │ $(version_cell "${VERSIONS[$i]}" "${URLS[$i]}") │"
+        done
+        TABLE="${TABLE}"$'\n'"└$(hline "${NAME_W}")┴$(hline "${VERSION_W}")┘"
+
+        SUMMARY_TEXT="*Charts published:*"$'\n'"\`\`\`"$'\n'"${TABLE}"$'\n'"\`\`\`"
+        WORKFLOW_URL="${SERVER_URL}/${REPOSITORY}/actions/runs/${RUN_ID}"
+
+        jq -n \
+          --arg version "${VERSION}" \
+          --arg summary "${SUMMARY_TEXT}" \
+          --arg workflow_url "${WORKFLOW_URL}" \
+          '{
+            "blocks": [
+              {
+                "type": "header",
+                "text": {"type": "plain_text", "text": (":white_check_mark: Nightly Build " + $version + " - Published")}
+              },
+              {
+                "type": "section",
+                "text": {"type": "mrkdwn", "text": $summary}
+              },
+              {
+                "type": "actions",
+                "elements": [
+                  {"type": "button", "text": {"type": "plain_text", "text": "View Run"}, "url": $workflow_url}
+                ]
+              }
+            ]
+          }' > /tmp/slack-payload.json
+
         curl -sf --max-time 15 -X POST "${SLACK_WEBHOOK_URL}" \
           -H "Content-Type: application/json" \
-          -d @- <<PAYLOAD
-        {
-          "blocks": [
-            {
-              "type": "header",
-              "text": {"type": "plain_text", "text": ":white_check_mark: Nightly Build ${VERSION} - Published"}
-            },
-            {
-              "type": "section",
-              "text": {
-                "type": "mrkdwn",
-                "text": "*Charts published to GHCR:*\n\`\`\`\nosac-operator-crds            ${VERSION}  ${OCI_BASE}/osac-operator-crds\nosac-operator                 ${VERSION}  ${OCI_BASE}/osac-operator\nfulfillment-service           ${VERSION}  ${OCI_BASE}/fulfillment-service\nosac-aap                      ${VERSION}  ${OCI_BASE}/osac-aap\nbare-metal-fulfillment-operator-crds  ${VERSION}  ${OCI_BASE}/bare-metal-fulfillment-operator-crds\nbare-metal-fulfillment-operator       ${VERSION}  ${OCI_BASE}/bare-metal-fulfillment-operator\nosac-ui                       ${VERSION}  ${OCI_BASE}/osac-ui\nosac (umbrella)               ${VERSION}  ${OCI_BASE}/osac\n\`\`\`\n*Tag:* \`v${VERSION}\`\n*Run:* <${SERVER_URL}/${REPOSITORY}/actions/runs/${RUN_ID}|View workflow>"
-              }
-            }
-          ]
-        }
-        PAYLOAD
+          -d @/tmp/slack-payload.json
 
   # -------------------------------------------------------------------
   # Job 5: Notify on failure (temp branch kept for debugging, see
@@ -503,22 +655,31 @@ jobs:
         RUN_ID: ${{ github.run_id }}
         REF_NAME: ${{ github.ref_name }}
       run: |
+        set -euo pipefail
+        WORKFLOW_URL="${SERVER_URL}/${REPOSITORY}/actions/runs/${RUN_ID}"
+
+        jq -n \
+          --arg branch "${REF_NAME}" \
+          --arg workflow_url "${WORKFLOW_URL}" \
+          '{
+            "blocks": [
+              {
+                "type": "header",
+                "text": {"type": "plain_text", "text": ":x: Nightly Build Failed"}
+              },
+              {
+                "type": "section",
+                "text": {"type": "mrkdwn", "text": ("*Branch:* `" + $branch + "`\nPlease investigate the failure.")}
+              },
+              {
+                "type": "actions",
+                "elements": [
+                  {"type": "button", "text": {"type": "plain_text", "text": "View Run"}, "url": $workflow_url}
+                ]
+              }
+            ]
+          }' > /tmp/slack-payload.json
+
         curl -sf --max-time 15 -X POST "${SLACK_WEBHOOK_URL}" \
           -H "Content-Type: application/json" \
-          -d @- <<PAYLOAD
-        {
-          "blocks": [
-            {
-              "type": "header",
-              "text": {"type": "plain_text", "text": ":x: Nightly Build Failed"}
-            },
-            {
-              "type": "section",
-              "text": {
-                "type": "mrkdwn",
-                "text": "*Run:* <${SERVER_URL}/${REPOSITORY}/actions/runs/${RUN_ID}|View workflow>\n*Branch:* \`${REF_NAME}\`\nPlease investigate the failure."
-              }
-            }
-          ]
-        }
-        PAYLOAD
+          -d @/tmp/slack-payload.json
