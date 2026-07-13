@@ -39,11 +39,13 @@ metadata:
 spec: {}
 EOF
 
-# Create stub hub secrets so the storage controller can skip AAP-based
-# backend provisioning (Stage 1) and proceed to storage class resolution
-# (Stage 2).  In production these are created by AAP playbooks against a
-# real VAST backend; in dev/CI environments without VAST, the stubs let
-# the controller resolve the labeled StorageClasses directly.
+# Create stub hub secrets so the storage controller can skip backend
+# provisioning and proceed to StorageClass resolution. In production
+# these are created by AAP playbooks against a real VAST backend; in
+# dev/CI environments without VAST, the stubs let the controller
+# resolve the labeled StorageClasses directly.
+# TODO(OSAC-1957): remove once the Backend API lets the controller
+# detect "no backend registered" and skip backend provisioning.
 for TENANT_NAME in "${INSTALLER_NAMESPACE}" "shared"; do
     cat <<HUBEOF | oc apply -f -
 apiVersion: v1
@@ -59,6 +61,8 @@ HUBEOF
 done
 
 # Wait for both tenants to be Ready
+# The storage controller resolves tenant-specific StorageClasses first,
+# falling back to the shared Default-labeled SC when none exist.
 retry_until 120 5 '[[ "$(oc get tenant ${INSTALLER_NAMESPACE} -n ${INSTALLER_NAMESPACE} -o jsonpath='"'"'{.status.phase}'"'"' 2>/dev/null)" == "Ready" ]]' || {
     echo "Timed out waiting for Tenant ${INSTALLER_NAMESPACE} to be Ready"
     exit 1
