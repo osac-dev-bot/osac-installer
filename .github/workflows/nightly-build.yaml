@@ -170,7 +170,6 @@ jobs:
       installer-ref: ${{ needs.prepare.outputs.temp-branch }}
       test-infra-repository: osac-project/osac-test-infra
       test-infra-ref: main
-    secrets: inherit
 
   # -------------------------------------------------------------------
   # Job 3: Publish charts (only if E2E passes)
