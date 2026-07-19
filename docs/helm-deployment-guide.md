@@ -168,8 +168,8 @@ oc logs -f job/osac-aap-bootstrap -n ${NAMESPACE}
 ### Template Publish Hook Failing
 
 The `osac-publish-templates` post-install hook must complete for Helm to
-report success. If it fails, cluster templates will not be available and
-`osac get clustertemplates` will return an empty list.
+report success. If it fails, cluster templates may be missing or incomplete
+(on upgrade, previously published templates may still exist).
 
 **Check hook pod status and logs:**
 
@@ -185,8 +185,10 @@ oc logs job/osac-publish-templates -n ${NAMESPACE} -c publish-templates     # ma
   `https://fulfillment-rest-gateway:8000/healthz` for up to 600s. If it
   times out, check that the fulfillment service pods are running and the
   `fulfillment-rest-gateway` Service exists.
-- **AAP token missing** - The main container reads the `osac-aap-api-token`
-  Secret. Verify it exists: `oc get secret osac-aap-api-token -n ${NAMESPACE}`.
+- **AAP token missing or empty** - The main container reads the `osac-aap-api-token`
+  Secret and fails if the token is absent or empty. Verify the secret exists
+  and contains a valid token:
+  `oc get secret osac-aap-api-token -n ${NAMESPACE} -o jsonpath='{.data.token}' | base64 -d`.
 - **AAP job template not found** - The `osac-publish-templates` job template
   must exist in AAP. Verify via AAP UI or API after the bootstrap job
   completes.
